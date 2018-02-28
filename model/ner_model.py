@@ -1,9 +1,21 @@
 import numpy as np
 import os
 import tensorflow as tf
+import keras
+import pandas as pd
+import sys
 
+from keras.layers import Flatten, Dense, Embedding, Dropout, Bidirectional, LSTM, Concatenate, Reshape, Lambda, Input, Activation
+from keras.layers.merge import concatenate
+from keras.models import Model
+from keras.optimizers import Adam
+from keras.preprocessing.sequence import pad_sequences
+from keras.preprocessing.text import one_hot
+from keras.utils import np_utils
+from keras_contrib.layers import CRF
 
-from .data_utils import minibatches, pad_sequences, get_chunks
+from model.data_utils import get_trimmed_glove_vectors, load_vocab, get_processing_word, CoNLLDataset, get_trimmed_glove_vectors, load_vocab, get_processing_word, minibatches, pad_sequences, get_chunks
+from model.ner_model import NERModel
 from .general_utils import Progbar
 from .base_model import BaseModel
 
@@ -17,33 +29,33 @@ class NERModel(BaseModel):
                            self.config.vocab_tags.items()}
 
 
-    def add_placeholders(self):
-        """Define placeholders = entries to computational graph"""
-        # shape = (batch size, max length of sentence in batch)
-        self.word_ids = tf.placeholder(tf.int32, shape=[None, None],
-                        name="word_ids")
+#     def add_placeholders(self):
+#         """Define placeholders = entries to computational graph"""
+#         # shape = (batch size, max length of sentence in batch)
+#         self.word_ids = tf.placeholder(tf.int32, shape=[None, None],
+#                         name="word_ids")
 
-        # shape = (batch size)
-        self.sequence_lengths = tf.placeholder(tf.int32, shape=[None],
-                        name="sequence_lengths")
+#         # shape = (batch size)
+#         self.sequence_lengths = tf.placeholder(tf.int32, shape=[None],
+#                         name="sequence_lengths")
 
-        # shape = (batch size, max length of sentence, max length of word)
-        self.char_ids = tf.placeholder(tf.int32, shape=[None, None, None],
-                        name="char_ids")
+#         # shape = (batch size, max length of sentence, max length of word)
+#         self.char_ids = tf.placeholder(tf.int32, shape=[None, None, None],
+#                         name="char_ids")
 
-        # shape = (batch_size, max_length of sentence)
-        self.word_lengths = tf.placeholder(tf.int32, shape=[None, None],
-                        name="word_lengths")
+#         # shape = (batch_size, max_length of sentence)
+#         self.word_lengths = tf.placeholder(tf.int32, shape=[None, None],
+#                         name="word_lengths")
 
-        # shape = (batch size, max length of sentence in batch)
-        self.labels = tf.placeholder(tf.int32, shape=[None, None],
-                        name="labels")
+#         # shape = (batch size, max length of sentence in batch)
+#         self.labels = tf.placeholder(tf.int32, shape=[None, None],
+#                         name="labels")
 
-        # hyper parameters
-        self.dropout = tf.placeholder(dtype=tf.float32, shape=[],
-                        name="dropout")
-        self.lr = tf.placeholder(dtype=tf.float32, shape=[],
-                        name="lr")
+#         # hyper parameters
+#         self.dropout = tf.placeholder(dtype=tf.float32, shape=[],
+#                         name="dropout")
+#         self.lr = tf.placeholder(dtype=tf.float32, shape=[],
+#                         name="lr")
 
 
     def get_feed_dict(self, words, labels=None, lr=None, dropout=None):
@@ -92,7 +104,7 @@ class NERModel(BaseModel):
         return feed, sequence_lengths
 
 
-    def add_word_embeddings_op(self):
+    def add_word_embeddings_op(self): #needs replaced with something else for keras?
         """Defines self.word_embeddings
 
         If self.config.embeddings is not None and is a np array initialized
@@ -133,23 +145,28 @@ class NERModel(BaseModel):
                         shape=[s[0]*s[1], s[-2], self.config.dim_char])
                 word_lengths = tf.reshape(self.word_lengths, shape=[s[0]*s[1]])
 
-                # bi lstm on chars
-                cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
-                        state_is_tuple=True)
-                cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
-                        state_is_tuple=True)
-                _output = tf.nn.bidirectional_dynamic_rnn(
-                        cell_fw, cell_bw, char_embeddings,
-                        sequence_length=word_lengths, dtype=tf.float32)
+#                 bi lstm on chars
+#                 cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
+#                         state_is_tuple=True)
+#                 cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_char,
+#                         state_is_tuple=True)
+#                 _output = tf.nn.bidirectional_dynamic_rnn(
+#                         cell_fw, cell_bw, char_embeddings,
+#                         sequence_length=word_lengths, dtype=tf.float32)
+                cell_fw = LSTM(hidden_size_char, return_sequences=False) 
+                cell_bw = LSTM(hidden_size_char, return_sequences=False, go_backwards=True)
+                _output = concatenate([fw_LSTM, bw_LSTM])(char_embeddings)#where embedding weights?
+                output = Dropout(self.dropout)(_output) 
 
-                # read and concat output
-                _, ((_, output_fw), (_, output_bw)) = _output
-                output = tf.concat([output_fw, output_bw], axis=-1)
+#                 # read and concat output
+#                 _, ((_, output_fw), (_, output_bw)) = _output
+#                 output = tf.concat([output_fw, output_bw], axis=-1)
 
                 # shape = (batch size, max sentence length, char hidden size)
-                output = tf.reshape(output,
-                        shape=[s[0], s[1], 2*self.config.hidden_size_char])
-                word_embeddings = tf.concat([word_embeddings, output], axis=-1)
+#                 output = tf.reshape(output,
+#                         shape=[s[0], s[1], 2*self.config.hidden_size_char]) # Do I need this?
+#                 word_embeddings = tf.concat([word_embeddings, output], axis=-1)
+                word_embeddings = concatenate([word embeddings, output], axis=-1)
 
         self.word_embeddings =  tf.nn.dropout(word_embeddings, self.dropout)
 
@@ -161,15 +178,19 @@ class NERModel(BaseModel):
         of scores, of dimension equal to the number of tags.
         """
         with tf.variable_scope("bi-lstm"):
-            cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
-            cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
-            (output_fw, output_bw), _ = tf.nn.bidirectional_dynamic_rnn(
-                    cell_fw, cell_bw, self.word_embeddings,
-                    sequence_length=self.sequence_lengths, dtype=tf.float32)
-            output = tf.concat([output_fw, output_bw], axis=-1)
-            output = tf.nn.dropout(output, self.dropout)
-
-        with tf.variable_scope("proj"):
+#             cell_fw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
+#             cell_bw = tf.contrib.rnn.LSTMCell(self.config.hidden_size_lstm)
+#             (output_fw, output_bw), _ = tf.nn.bidirectional_dynamic_rnn(
+#                     cell_fw, cell_bw, self.word_embeddings,
+#                     sequence_length=self.sequence_lengths, dtype=tf.float32)
+#             output = tf.concat([output_fw, output_bw], axis=-1)
+#             output = tf.nn.dropout(output, self.dropout)
+            cell_fw = LSTM(hidden_size_lstm, return_sequences=False) 
+            cell_bw = LSTM(hidden_size_lstm, return_sequences=False, go_backwards=True)
+            output = concatenate([fw_LSTM, bw_LSTM])(word_embeddings)
+            output = Dropout(self.dropout)(output) #where embedding weights?
+            
+        with tf.variable_scope("proj"): #not sure what to do here
             W = tf.get_variable("W", dtype=tf.float32,
                     shape=[2*self.config.hidden_size_lstm, self.config.ntags])
 
@@ -196,7 +217,7 @@ class NERModel(BaseModel):
                     tf.int32)
 
 
-    def add_loss_op(self):
+    def add_loss_op(self): #can redo with keras contrib crf
         """Defines the loss"""
         if self.config.use_crf:
             log_likelihood, trans_params = tf.contrib.crf.crf_log_likelihood(
@@ -216,7 +237,7 @@ class NERModel(BaseModel):
 
     def build(self):
         # NER specific functions
-        self.add_placeholders()
+#         self.add_placeholders()
         self.add_word_embeddings_op()
         self.add_logits_op()
         self.add_pred_op()
